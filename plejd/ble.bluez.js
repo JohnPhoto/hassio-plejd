@@ -60,7 +60,7 @@ class PlejdService extends EventEmitter {
     this.writeQueueWaitTime = writeQueueWaitTime;
     this.writeQueue = [];
     this.writeQueueRef = null;
-    this.delayedInit = null;
+    this.retryWriteQueue = [];
 
     this.maxQueueLengthTarget = MAX_WRITEQUEUE_LENGTH_TARGET || this.devices.length || 5;
     logger('Max global transition queue length target', this.maxQueueLengthTarget)
@@ -98,7 +98,7 @@ class PlejdService extends EventEmitter {
     };
 
     clearInterval(this.pingRef);
-    clearInterval(this.writeQueueRef);
+    clearTimeout(this.writeQueueRef);
     console.log('init()');
 
     const bluez = await this.bus.getProxyObject(BLUEZ_SERVICE_NAME, '/');
@@ -369,25 +369,13 @@ class PlejdService extends EventEmitter {
     }
 
     // auth done, start ping
-    await this.startPing();
-    await this.startWriteQueue();
+    this.startPing();
+    this.startWriteQueue();
 
     // After we've authenticated, we need to hook up the event listener
     // for changes to lastData.
     this.characteristics.lastDataProperties.on('PropertiesChanged', this.onLastDataUpdated.bind(this));
     this.characteristics.lastData.StartNotify();
-  }
-
-  async throttledInit(delay) {
-    if(this.delayedInit){
-      return this.delayedInit;
-    }
-   this.delayedInit = new Promise((resolve) => setTimeout(async () => {
-     const result = await this.init();
-     this.delayedInit = null;
-     resolve(result)
-   }, delay))
-   return this.delayedInit;
   }
 
   async write(data, retry = true) {
@@ -405,16 +393,11 @@ class PlejdService extends EventEmitter {
         return;
       }
       console.log('plejd-ble: write failed ' + err);
-      await this.throttledInit(this.connectionTimeout * 1000);
-
-      if(retry){
-        logger('reconnected and retrying to write');
-        await this.write(data, false);
-      }
+      throw err;
     }
   }
 
-  async startPing() {
+  startPing() {
     console.log('startPing()');
     clearInterval(this.pingRef);
 
@@ -460,20 +443,37 @@ class PlejdService extends EventEmitter {
     this.emit('pingSuccess', pong[0]);
   }
 
-  async startWriteQueue() {
+  startWriteQueue() {
     console.log('startWriteQueue()');
-    clearInterval(this.writeQueueRef);
+    clearTimeout(this.writeQueueRef);
 
     this.writeQueueRef = setTimeout(() => this.runWriteQueue(), this.writeQueueWaitTime);
   }
 
   async runWriteQueue() {
+    while (this.retryWriteQueue.length > 0) {
+      const data = this.retryWriteQueue.pop();
+      try {
+        await this.write(data);
+      } catch (err){
+        // We do not care, it got 2 tries already.
+      }
+    }
     while (this.writeQueue.length > 0) {
       const data = this.writeQueue.pop();
-      await this.write(data, true);
+      try {
+        await this.write(data, true);
+      } catch (err) {
+        this.retryWriteQueue.push(data);
+      }
     }
 
-    this.writeQueueRef = setTimeout(() => this.runWriteQueue(), this.writeQueueWaitTime);
+    if(this.retryWriteQueue.length > 0){
+      this.init(this.connectionTimeout * 1000);
+    } else {
+      this.writeQueueRef = setTimeout(() => this.runWriteQueue(), this.writeQueueWaitTime);
+    }
+
   }
 
   async _processPlejdService(path, characteristics) {
